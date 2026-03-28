@@ -83,14 +83,14 @@ fn get_lbug_root() -> PathBuf {
         println!("Downloading ladybug source version {version}...");
         let url = if version.starts_with('v') {
             format!(
-                "https://github.com/LadybugDB/ladybug/archive/refs/tags/{}.tar.gz",
+                "https://github.com/partoa/ladybug/archive/refs/tags/{}.tar.gz",
                 version
             )
         } else if version == "main" {
-            "https://github.com/LadybugDB/ladybug/archive/refs/heads/main.tar.gz".to_string()
+            "https://github.com/partoa/ladybug/archive/refs/heads/main.tar.gz".to_string()
         } else {
             format!(
-                "https://github.com/LadybugDB/ladybug/archive/refs/tags/v{}.tar.gz",
+                "https://github.com/partoa/ladybug/archive/refs/tags/v{}.tar.gz",
                 version
             )
         };
