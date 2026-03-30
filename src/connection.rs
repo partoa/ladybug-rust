@@ -253,6 +253,40 @@ impl<'a> Connection<'a> {
         result
     }
 
+    /// Insert rows from an Arrow `RecordBatch` into an existing REL table.
+    ///
+    /// The batch MUST have "source" and "target" as its first two columns (INT64),
+    /// followed by any REL property columns in schema order.
+    ///
+    /// Creates a temporary Arrow-backed node table, copies into the target REL table
+    /// via `COPY ... FROM (MATCH ...)`, then drops the temp table.
+    ///
+    /// *Requires the `arrow` feature.*
+    #[cfg(feature = "arrow")]
+    pub fn insert_arrow_rel(
+        &self,
+        rel_table_name: &str,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<QueryResult<'a>, Error> {
+        let temp_name = format!("_arrow_rel_tmp_{}", rel_table_name);
+        self.create_node_table_from_arrow(&temp_name, batch)?;
+
+        let columns: Vec<String> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| format!("t.{}", f.name()))
+            .collect();
+        let col_list = columns.join(", ");
+
+        let copy_query = format!(
+            "COPY {rel_table_name} FROM (MATCH (t:{temp_name}) RETURN {col_list})"
+        );
+        let result = self.query(&copy_query);
+        let _ = self.drop_arrow_table(&temp_name);
+        result
+    }
+
     /// Upsert rows from an Arrow `RecordBatch` into an existing node table.
     ///
     /// Uses Cypher `MERGE` to match on the primary key (first column).
@@ -327,5 +361,62 @@ impl<'a> Connection<'a> {
     pub fn set_query_timeout(&self, timeout_ms: u64) {
         let conn = unsafe { (*self.conn.get()).pin_mut() };
         conn.setQueryTimeOut(timeout_ms);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::SYSTEM_CONFIG_FOR_TESTS;
+
+    #[test]
+    #[cfg(feature = "arrow")]
+    fn test_insert_arrow_rel() -> anyhow::Result<()> {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let temp_dir = tempfile::tempdir()?;
+        let db = Database::new(temp_dir.path().join("test"), SYSTEM_CONFIG_FOR_TESTS)?;
+        let conn = Connection::new(&db)?;
+
+        // Create Person node table and insert two rows
+        conn.query("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id));")?;
+        conn.query("CREATE (:Person {id: 1, name: 'Alice'});")?;
+        conn.query("CREATE (:Person {id: 2, name: 'Bob'});")?;
+
+        // Create Knows REL table
+        conn.query("CREATE REL TABLE Knows(FROM Person TO Person, since INT64);")?;
+
+        // Build a RecordBatch: source, target, since
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("source", DataType::Int64, false),
+            Field::new("target", DataType::Int64, false),
+            Field::new("since", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(Int64Array::from(vec![2024])),
+            ],
+        )?;
+
+        // Insert via Arrow
+        conn.insert_arrow_rel("Knows", &batch)?;
+
+        // Query and verify
+        let mut result =
+            conn.query("MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id, b.id, r.since;")?;
+        let row = result.next().expect("expected one row");
+        assert_eq!(row[0], Value::Int64(1));
+        assert_eq!(row[1], Value::Int64(2));
+        assert_eq!(row[2], Value::Int64(2024));
+        assert!(result.next().is_none(), "expected exactly one row");
+
+        temp_dir.close()?;
+        Ok(())
     }
 }
