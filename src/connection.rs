@@ -253,6 +253,40 @@ impl<'a> Connection<'a> {
         result
     }
 
+    /// Insert rows from an Arrow `RecordBatch` into an existing REL table.
+    ///
+    /// The batch MUST have "source" and "target" as its first two columns (INT64),
+    /// followed by any REL property columns in schema order.
+    ///
+    /// Creates a temporary Arrow-backed node table, copies into the target REL table
+    /// via `COPY ... FROM (MATCH ...)`, then drops the temp table.
+    ///
+    /// *Requires the `arrow` feature.*
+    #[cfg(feature = "arrow")]
+    pub fn insert_arrow_rel(
+        &self,
+        rel_table_name: &str,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<QueryResult<'a>, Error> {
+        let temp_name = format!("_arrow_rel_tmp_{}", rel_table_name);
+        self.create_node_table_from_arrow(&temp_name, batch)?;
+
+        let columns: Vec<String> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| format!("t.{}", f.name()))
+            .collect();
+        let col_list = columns.join(", ");
+
+        let copy_query = format!(
+            "COPY {rel_table_name} FROM (MATCH (t:{temp_name}) RETURN {col_list})"
+        );
+        let result = self.query(&copy_query);
+        let _ = self.drop_arrow_table(&temp_name);
+        result
+    }
+
     /// Upsert rows from an Arrow `RecordBatch` into an existing node table.
     ///
     /// Uses Cypher `MERGE` to match on the primary key (first column).
