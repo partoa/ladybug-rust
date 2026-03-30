@@ -363,3 +363,60 @@ impl<'a> Connection<'a> {
         conn.setQueryTimeOut(timeout_ms);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::SYSTEM_CONFIG_FOR_TESTS;
+
+    #[test]
+    #[cfg(feature = "arrow")]
+    fn test_insert_arrow_rel() -> anyhow::Result<()> {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let temp_dir = tempfile::tempdir()?;
+        let db = Database::new(temp_dir.path().join("test"), SYSTEM_CONFIG_FOR_TESTS)?;
+        let conn = Connection::new(&db)?;
+
+        // Create Person node table and insert two rows
+        conn.query("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id));")?;
+        conn.query("CREATE (:Person {id: 1, name: 'Alice'});")?;
+        conn.query("CREATE (:Person {id: 2, name: 'Bob'});")?;
+
+        // Create Knows REL table
+        conn.query("CREATE REL TABLE Knows(FROM Person TO Person, since INT64);")?;
+
+        // Build a RecordBatch: source, target, since
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("source", DataType::Int64, false),
+            Field::new("target", DataType::Int64, false),
+            Field::new("since", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(Int64Array::from(vec![2024])),
+            ],
+        )?;
+
+        // Insert via Arrow
+        conn.insert_arrow_rel("Knows", &batch)?;
+
+        // Query and verify
+        let mut result =
+            conn.query("MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id, b.id, r.since;")?;
+        let row = result.next().expect("expected one row");
+        assert_eq!(row[0], Value::Int64(1));
+        assert_eq!(row[1], Value::Int64(2));
+        assert_eq!(row[2], Value::Int64(2024));
+        assert!(result.next().is_none(), "expected exactly one row");
+
+        temp_dir.close()?;
+        Ok(())
+    }
+}
