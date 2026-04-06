@@ -6,6 +6,12 @@ edition = "2021"
 [dependencies]
 lbug = { path = ".." }
 arrow = { version = "55", optional = true, default-features = false, features = [] }
+tempfile = "3"
 
 [features]
 arrow = ["lbug/arrow", "dep:arrow"]
+
+[[bin]]
+name = "bench_arrow"
+path = "../bench_arrow.rs"
+required-features = ["arrow"]
