@@ -287,6 +287,72 @@ impl<'a> Connection<'a> {
         result
     }
 
+    /// Upsert rows from an Arrow `RecordBatch` into an existing REL table.
+    ///
+    /// The batch MUST have "source" and "target" as its first two columns (INT64),
+    /// followed by any REL property columns in schema order.
+    ///
+    /// Uses `MATCH` on source/target endpoints and `SET` to update properties on
+    /// existing edges, or `CREATE` to insert new ones via `MERGE`.
+    ///
+    /// *Requires the `arrow` feature.*
+    #[cfg(feature = "arrow")]
+    pub fn upsert_arrow_rel(
+        &self,
+        rel_table_name: &str,
+        from_table: &str,
+        to_table: &str,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<QueryResult<'a>, Error> {
+        let schema = batch.schema();
+        let fields: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+
+        if fields.len() < 2 {
+            return Err(Error::FailedQuery(
+                "RecordBatch must have at least source and target columns".into(),
+            ));
+        }
+
+        let temp_name = format!("_arrow_rel_tmp_{}", rel_table_name);
+        self.create_node_table_from_arrow(&temp_name, batch)?;
+
+        let src_col = fields[0]; // "source"
+        let tgt_col = fields[1]; // "target"
+        let prop_fields: Vec<&&str> = fields[2..].iter().collect();
+
+        let set_clause: String = prop_fields
+            .iter()
+            .map(|f| format!("r.{f} = t.{f}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let query = if prop_fields.is_empty() {
+            format!(
+                "MATCH (t:{temp_name}) \
+                 MATCH (a:{from_table} {{id: t.{src_col}}}) \
+                 MATCH (b:{to_table} {{id: t.{tgt_col}}}) \
+                 MERGE (a)-[r:{rel_table_name}]->(b)"
+            )
+        } else {
+            format!(
+                "MATCH (t:{temp_name}) \
+                 MATCH (a:{from_table} {{id: t.{src_col}}}) \
+                 MATCH (b:{to_table} {{id: t.{tgt_col}}}) \
+                 MERGE (a)-[r:{rel_table_name}]->(b) \
+                 ON MATCH SET {set_clause} \
+                 ON CREATE SET {set_clause}"
+            )
+        };
+
+        let result = self.query(&query);
+        let _ = self.drop_arrow_table(&temp_name);
+        result
+    }
+
     /// Upsert rows from an Arrow `RecordBatch` into an existing node table.
     ///
     /// Uses Cypher `MERGE` to match on the primary key (first column).
@@ -415,6 +481,72 @@ mod tests {
         assert_eq!(row[1], Value::Int64(2));
         assert_eq!(row[2], Value::Int64(2024));
         assert!(result.next().is_none(), "expected exactly one row");
+
+        temp_dir.close()?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "arrow")]
+    fn test_upsert_arrow_rel() -> anyhow::Result<()> {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let temp_dir = tempfile::tempdir()?;
+        let db = Database::new(temp_dir.path().join("test"), SYSTEM_CONFIG_FOR_TESTS)?;
+        let conn = Connection::new(&db)?;
+
+        conn.query("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id));")?;
+        conn.query("CREATE (:Person {id: 1, name: 'Alice'});")?;
+        conn.query("CREATE (:Person {id: 2, name: 'Bob'});")?;
+        conn.query("CREATE REL TABLE Knows(FROM Person TO Person, since INT64);")?;
+
+        // Initial insert: edge 1->2 with since=2020
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("source", DataType::Int64, false),
+            Field::new("target", DataType::Int64, false),
+            Field::new("since", DataType::Int64, false),
+        ]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(Int64Array::from(vec![2020])),
+            ],
+        )?;
+        conn.upsert_arrow_rel("Knows", "Person", "Person", &batch1)?;
+
+        // Verify initial insert
+        let mut result =
+            conn.query("MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id, b.id, r.since;")?;
+        let row = result.next().expect("expected one row");
+        assert_eq!(row[0], Value::Int64(1));
+        assert_eq!(row[1], Value::Int64(2));
+        assert_eq!(row[2], Value::Int64(2020));
+        assert!(result.next().is_none(), "expected exactly one row after insert");
+
+        // Upsert: same edge 1->2 but update since to 2025
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(Int64Array::from(vec![2025])),
+            ],
+        )?;
+        conn.upsert_arrow_rel("Knows", "Person", "Person", &batch2)?;
+
+        // Verify upsert updated the property, not duplicated the edge
+        let mut result =
+            conn.query("MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id, b.id, r.since;")?;
+        let row = result.next().expect("expected one row");
+        assert_eq!(row[0], Value::Int64(1));
+        assert_eq!(row[1], Value::Int64(2));
+        assert_eq!(row[2], Value::Int64(2025));
+        assert!(result.next().is_none(), "expected exactly one row after upsert");
 
         temp_dir.close()?;
         Ok(())
